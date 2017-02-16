@@ -120,7 +120,8 @@ plugin.process = function(token, callback) {
 		async.apply(jwt.verify, token, plugin.settings.secret),
 		async.apply(plugin.verifyToken),
 		async.apply(plugin.findUser),
-		async.apply(plugin.verifyUser)
+		async.apply(plugin.verifyUser),
+		async.apply(plugin.updateProfile)
 	], callback);
 };
 
@@ -138,14 +139,14 @@ plugin.verifyToken = function(payload, callback) {
 	callback(null, payload);
 };
 
-plugin.verifyUser = function(uid, callback) {
+plugin.verifyUser = function(data, callback) {
 	// Check ban state of user, reject if banned
-	user.getUserField(uid, 'banned', function(err, banned) {
+	user.getUserField(data.uid, 'banned', function(err, banned) {
 		if (err || parseInt(banned, 10) === 1) {
 			return callback(err || new Error('banned'));
 		}
 
-		callback(null, uid);
+		callback(null, {uid: data.uid, payload: data.payload});
 	});
 };
 
@@ -180,7 +181,7 @@ plugin.findUser = function(payload, callback) {
 				if (err) {
 					return callback(err);
 				} else if (exists) {
-					return callback(null, checks.uid);
+					return callback(null, {uid: checks.uid, payload: payload});
 				} else {
 					async.series([
 						async.apply(db.deleteObjectField, plugin.settings.name + ':uid', id),	// reference is outdated, user got deleted
@@ -197,7 +198,12 @@ plugin.findUser = function(payload, callback) {
 			});
 		} else {
 			// No match, create a new user
-			plugin.createUser(payload, callback);
+			winston.info('[session-sharing] Creating a new user');
+			async.series([
+				async.apply(plugin.createUser, payload)
+			], function (err, data) {
+				callback(err, data[1]);
+			});
 		}
 	});
 };
@@ -229,7 +235,6 @@ plugin.createUser = function(payload, callback) {
 	user.create({
 		username: username,
 		email: email,
-		picture: picture,
 		fullname: [firstName, lastName].join(' ').trim()
 	}, function(err, uid) {
 		if (err) { return callback(err); }
@@ -237,7 +242,67 @@ plugin.createUser = function(payload, callback) {
 		db.setObjectField(plugin.settings.name + ':uid', id, uid, function (err) {
 			callback(err, uid);
 		});
+
+		var query = {
+			updateProfile: async.apply(user.updateProfile, uid, {
+				fullname: [firstName, lastName].join(' ').trim()
+			})
+		};
+
+		if (picture) {
+			winston.info('[session-sharing] Updating picture for user with id ' + uid + ' to ' + picture);
+		
+			query.updatePicture = async.apply(user.setUserFields, uid, {
+				picture: picture
+			});
+		}
+
+		async.parallel(query, function (err, done) {
+			if (err) {
+				return callback(err);
+			}
+			
+			callback(null, uid);
+		});
+
 	});
+};
+
+plugin.updateProfile = function(data, callback) {
+		var uid = data.uid,
+		     payload = data.payload;
+		var parent = plugin.settings['payload:parent'],
+			id = parent ? payload[parent][plugin.settings['payload:id']] : payload[plugin.settings['payload:id']],
+			email = parent ? payload[parent][plugin.settings['payload:email']] : payload[plugin.settings['payload:email']],
+			username = parent ? payload[parent][plugin.settings['payload:username']] : payload[plugin.settings['payload:username']],
+			firstName = parent ? payload[parent][plugin.settings['payload:firstName']] : payload[plugin.settings['payload:firstName']],
+			lastName = parent ? payload[parent][plugin.settings['payload:lastName']] : payload[plugin.settings['payload:lastName']],
+			picture = parent ? payload[parent][plugin.settings['payload:picture']] : payload[plugin.settings['payload:picture']];
+			
+			
+			
+		var profileData = {
+			email: email,
+			username: username,
+			fullname: [firstName, lastName].join(' ').trim()
+		};
+
+                // Declare async.parellel query, add optional parameters to it if true
+                var query = {
+                  updated: async.apply(user.updateProfile, data.uid, profileData)
+                };
+
+                if (picture !== undefined) {
+                  query.image = async.apply(user.setUserFields, data.uid, { uploadedpicture: picture, picture: picture });
+                }
+                // End optional async.parallel query
+		
+		async.parallel(query, function (err, done) {
+			if (err) {
+				return callback(err);
+			}
+			callback(null, done.updated.uid);
+		});
 };
 
 plugin.addMiddleware = function(req, res, next) {
